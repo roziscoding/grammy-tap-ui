@@ -1,77 +1,91 @@
-import { createEventStream } from 'h3'
+import { type H3Event, createEventStream } from 'h3'
 
 interface IdentifiedEventStream {
   id: string
   stream: ReturnType<typeof createEventStream>
+  isConsumed: boolean
 }
 
-const streams = {
-  botError: [] as IdentifiedEventStream[],
-  update: [] as IdentifiedEventStream[],
-  request: [] as IdentifiedEventStream[],
-  all: [] as IdentifiedEventStream[],
-}
+const streams = new Map<string, IdentifiedEventStream>()
+
+type EventType = 'botError' | 'update' | 'request'
 
 function isValidEventType(
   eventType: string,
-): eventType is keyof typeof streams {
-  return Object.keys(streams).includes(eventType)
+): eventType is EventType {
+  return ['botError', 'update', 'request'].includes(eventType)
+}
+
+async function getOrCreateStream(event: H3Event, sessionId: string, recreate = true) {
+  const existingStream = streams.get(sessionId)
+
+  if (existingStream && (!existingStream.isConsumed || !recreate)) {
+    return existingStream
+  }
+
+  if (existingStream) {
+    await existingStream.stream.close()
+    streams.delete(sessionId)
+  }
+
+  const eventStream = createEventStream(event)
+  eventStream.onClosed(() => {
+    streams.delete(sessionId)
+  })
+
+  const stream = { id: sessionId, stream: eventStream, isConsumed: false }
+
+  streams.set(sessionId, stream)
+  return stream
 }
 
 export default defineEventHandler(async (event) => {
-  const eventType = getRouterParam(event, 'eventType') ?? ''
-
   if (event.path.endsWith('/stats') && event.method === 'GET') {
     return {
-      streams: Object.fromEntries(
-        Object.entries(streams).map(([key, value]) => [key, value.length]),
-      ),
+      streams: streams.size,
     }
   }
 
-  if (!isValidEventType(eventType)) {
-    setResponseStatus(event, 422, 'Unprocessable Content')
+  const eventType = getRouterParam(event, 'eventType') ?? ''
+  const sessionId = getHeader(event, 'x-session-id') ?? getQuery(event).sessionId?.toString()
+
+  if (!sessionId) {
+    setResponseStatus(event, 401, 'Unauthorized')
     return {
-      error: 'Invalid event type. Must be one of: botError, update, request, all',
+      error: 'Missing x-session-id header',
     }
   }
 
   if (event.method === 'GET') {
-    const eventStream = createEventStream(event)
-    const streamId = crypto.randomUUID()
-    eventStream.push([{
-      event: 'handshake',
-      data: JSON.stringify({ id: streamId }),
-    }])
-    streams[eventType].push({ id: streamId, stream: eventStream })
-    eventStream.onClosed(() => {
-      streams[eventType] = streams[eventType].filter(stream =>
-        stream.id !== streamId,
-      )
-    })
-    return eventStream.send()
-  }
+    const stream = await getOrCreateStream(event, sessionId)
 
-  if (event.method === 'POST') {
-    if (eventType === 'all') {
-      setResponseStatus(event, 422, 'Unprocessable Content')
+    if (stream.isConsumed) {
+      setResponseStatus(event, 409, 'Conflict')
       return {
-        error:
-          'Cannot emit event of type "all". Must be one of: botError, update, request',
+        error: 'Stream already consumed',
       }
     }
 
+    stream.isConsumed = true
+    return stream.stream.send()
+  }
+
+  if (event.method === 'POST') {
+    if (!isValidEventType(eventType)) {
+      setResponseStatus(event, 422, 'Unprocessable Content')
+      return {
+        error:
+          'Invalid event type. Must be one of: botError, update, request',
+      }
+    }
+
+    const stream = await getOrCreateStream(event, sessionId, false)
     const body = JSON.parse(await readBody(event))
 
-    const streamsToEmitTo = [...streams[eventType], ...streams.all]
-
-    streamsToEmitTo.forEach(({ stream }) =>
-      stream.push({
-        event: eventType,
-        data: JSON.stringify({ id: crypto.randomUUID(), ...body }),
-      }),
-    )
-    return sendNoContent(event)
+    stream.stream.push({
+      event: eventType,
+      data: JSON.stringify({ id: crypto.randomUUID(), ...body }),
+    })
   }
 
   return sendNoContent(event)
